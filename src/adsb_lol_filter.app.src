@@ -1,0 +1,18 @@
+{application, adsb_lol_filter, [
+    {description, "em_filter example for ADSB.lol"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {mod, {adsb_lol_filter_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        jsone,
+        cowboy,
+	ssl,
+        em_filter
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, [{"GitHub", "https://github.com/EmergenceSystem/adsb_lol_filter"}]}
+]}.
