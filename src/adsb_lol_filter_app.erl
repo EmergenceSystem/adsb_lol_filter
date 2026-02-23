@@ -1,29 +1,18 @@
 %%%-------------------------------------------------------------------
-%%% @doc ADS-B aircraft data agent using the adsb.lol API.
-%%%
-%%% As an agent this module:
-%%%   - Announces capabilities to em_disco on startup via `agent_hello'.
-%%%   - Maintains a memory of tracking URLs already returned, so
-%%%     duplicate aircraft across successive queries are filtered out.
-%%%
-%%% Handler contract: `handle/2' (Body, Memory) -> {RawList, NewMemory}.
-%%% Returns a raw Erlang list — em_filter_server encodes it.
-%%% Memory schema: `#{seen => #{binary_url => true}}'.
-%%% @end
+%%% @doc
+%%% ADS-B Aircraft Data Agent using the adsb.lol API.
+%%% Maintains memory to avoid duplicates across queries.
 %%%-------------------------------------------------------------------
+
 -module(adsb_lol_filter_app).
 -behaviour(application).
 
 -export([start/2, stop/1]).
--export([handle/1, handle/2]).
+-export([handle/2]).
 
--define(BASE_URL,    "https://api.adsb.lol/v2/").
--define(MIN_ALTITUDE, 0).
--define(MAX_ALTITUDE, 50000).
--define(MIN_SPEED,    0).
--define(MAX_SPEED,    1000).
--define(MAX_RESULTS,  100).
--define(MAX_RADIUS,   250).
+-define(BASE_URL, "https://api.adsb.lol/v2/").
+-define(MAX_RESULTS, 100).
+-define(MAX_RADIUS, 250).
 
 -define(CAPABILITIES, [
     <<"adsb">>,
@@ -34,7 +23,7 @@
 ]).
 
 %%====================================================================
-%% Application behaviour
+%% Application Behaviour
 %%====================================================================
 
 start(_Type, _Args) ->
@@ -44,280 +33,198 @@ start(_Type, _Args) ->
     }).
 
 stop(_State) ->
-    em_filter:stop_filter(adsb_lol_filter).
+    em_filter:stop_agent(adsb_lol_filter).
 
 %%====================================================================
-%% Agent handler — with memory (primary path)
+%% Main Handler
+%% Receives Body (JSON or plain text) and Memory.
+%% Returns {List of aircraft embryos, updated memory}.
 %%====================================================================
 
 handle(Body, Memory) when is_binary(Body) ->
-    Seen    = maps:get(seen, Memory, #{}),
-    Embryos = generate_embryo_list(Body),
-    Fresh   = [E || E <- Embryos, not maps:is_key(url_of(E), Seen)],
-    NewSeen = lists:foldl(fun(E, Acc) ->
-        Acc#{url_of(E) => true}
-    end, Seen, Fresh),
-    {Fresh, Memory#{seen => NewSeen}};
+    io:format("~n[adsb] handle called with body: ~p~n", [Body]),
 
-handle(_Body, Memory) ->
+    %% Normalize input
+    NormalizedBody = normalize_body(Body),
+
+    Seen = maps:get(seen, Memory, #{}),
+    Embryos = generate_embryo_list(NormalizedBody),
+
+    Fresh = [E || E <- Embryos, not maps:is_key(url_of(E), Seen)],
+    UpdatedSeen = lists:foldl(fun(E, Acc) -> Acc#{url_of(E) => true} end, Seen, Fresh),
+
+    {Fresh, Memory#{seen => UpdatedSeen}};
+
+handle(_, Memory) ->
     {[], Memory}.
 
 %%====================================================================
-%% Plain filter handler — backward compatibility
+%% Normalize body: wrap plain text or missing "value" into JSON
 %%====================================================================
 
-handle(Body) when is_binary(Body) ->
-    generate_embryo_list(Body);
-handle(_) ->
-    [].
+normalize_body(Body) ->
+    case catch json:decode(Body) of
+        Map when is_map(Map) ->
+            case maps:get(<<"value">>, Map, undefined) of
+                undefined -> wrap_value(Body);
+                _ -> Body
+            end;
+        _ ->
+            wrap_value(Body)
+    end.
+
+wrap_value(Body) ->
+    list_to_binary(
+        io_lib:format("{\"value\":\"~s\"}", [binary_to_list(Body)])
+    ).
 
 %%====================================================================
-%% Query dispatch (unchanged)
+%% Generate embryo list from JSON body
 %%====================================================================
 
 generate_embryo_list(JsonBinary) ->
-    try json:decode(JsonBinary) of
+    case catch json:decode(JsonBinary) of
         Map when is_map(Map) ->
-            Value        = binary_to_list(maps:get(<<"value">>,      Map, <<>>)),
-            QueryTypeRaw = binary_to_list(maps:get(<<"query_type">>, Map, <<"auto">>)),
-            QueryType    = case QueryTypeRaw of
-                "auto" -> detect_query_type(Value);
-                Other  -> Other
-            end,
+            Value = binary_to_list(maps:get(<<"value">>, Map, <<>>)),
+            RawType = binary_to_list(maps:get(<<"query_type">>, Map, <<"auto">>)),
+            QueryType =
+                case RawType of
+                    "auto" -> detect_query_type(Value);
+                    Other -> Other
+                end,
             fetch_by_type(QueryType, Value, Map);
         _ -> []
-    catch
-        _:_ -> []
     end.
+
+%%====================================================================
+%% Detect query type based on input string
+%%====================================================================
 
 detect_query_type(Value) ->
-    case length(Value) of
+    case string:len(Value) of
         6 ->
-            case all_hex_chars(Value) of
-                true  -> "icao";
-                false -> detect_other_types(Value)
+            case is_hex(Value) of
+                true -> "icao";
+                false -> "callsign"
             end;
-        _ -> detect_other_types(Value)
+        _ -> "callsign"
     end.
 
-all_hex_chars([]) -> true;
-all_hex_chars([H | T]) ->
-    if (H >= $0 andalso H =< $9) orelse
-       (H >= $A andalso H =< $F) orelse
-       (H >= $a andalso H =< $f) -> all_hex_chars(T);
-       true -> false
-    end.
+%% Helper: check if string is hex
+is_hex(Str) ->
+    lists:all(
+        fun(C) ->
+            (C >= $0 andalso C =< $9) orelse
+            (C >= $A andalso C =< $F) orelse
+            (C >= $a andalso C =< $f)
+        end,
+        Str
+    ).
 
-detect_other_types(Value) ->
-    case re:run(Value, "^[A-Z]{1,2}-[A-Z0-9]{1,5}$|^N[0-9]{1,5}[A-Z]{0,2}$",
-                [caseless]) of
-        {match, _} -> "registration";
-        nomatch ->
-            case re:run(Value, "^[A-Z][A-Z0-9]{2,3}$", [caseless]) of
-                {match, _} when length(Value) >= 3, length(Value) =< 4 ->
-                    IsType = lists:member(string:to_upper(Value), aircraft_types()),
-                    if IsType -> "type"; true -> "callsign" end;
-                _ ->
-                    if length(Value) > 0 -> "callsign"; true -> "unknown" end
-            end
-    end.
+%%====================================================================
+%% Fetch aircraft data based on query type
+%%====================================================================
 
-aircraft_types() ->
-    ["A320","A321","A330","A340","A350","A380",
-     "B737","B738","B739","B747","B757","B767","B777","B787",
-     "E190","E195","CRJ2","CRJ7","CRJ9","DHC8","AT72"].
-
+fetch_by_type("icao", Value, _) ->
+    fetch_aircraft(fmt("icao/~s", [Value]));
+fetch_by_type("callsign", Value, _) ->
+    fetch_aircraft(fmt("callsign/~s", [Value]));
+fetch_by_type("registration", Value, _) ->
+    fetch_aircraft(fmt("registration/~s", [Value]));
+fetch_by_type("type", Value, _) ->
+    fetch_aircraft(fmt("type/~s", [Value]));
 fetch_by_type("point", _, #{<<"lat">> := Lat, <<"lon">> := Lon, <<"radius">> := R}) ->
-    fetch_aircraft_by_point(binary_to_list(Lat), binary_to_list(Lon), binary_to_list(R));
+    fetch_aircraft(fmt("point/~s/~s/~s", [binary_to_list(Lat), binary_to_list(Lon), limit_radius(R)]));
 fetch_by_type("closest", _, #{<<"lat">> := Lat, <<"lon">> := Lon, <<"radius">> := R}) ->
-    fetch_closest_aircraft(binary_to_list(Lat), binary_to_list(Lon), binary_to_list(R));
-fetch_by_type("callsign",     V, _) -> fetch_aircraft_by_callsign(V);
-fetch_by_type("icao",         V, _) -> fetch_aircraft_by_icao(V);
-fetch_by_type("registration", V, _) -> fetch_aircraft_by_registration(V);
-fetch_by_type("type",         V, _) -> fetch_aircraft_by_type(V);
-fetch_by_type("squawk",       V, _) -> fetch_aircraft_by_squawk(V);
-fetch_by_type("military",     _, _) -> fetch_military_aircraft();
-fetch_by_type("pia",          _, _) -> fetch_pia_aircraft();
-fetch_by_type("ladd",         _, _) -> fetch_ladd_aircraft();
-fetch_by_type(_Unknown,       _, _) -> [].
+    fetch_aircraft(fmt("closest/~s/~s/~s", [binary_to_list(Lat), binary_to_list(Lon), limit_radius(R)]));
+fetch_by_type(_, _, _) -> [].
 
 limit_radius(R) ->
     case catch list_to_integer(R) of
-        {'EXIT', _}                -> integer_to_list(?MAX_RADIUS);
+        {'EXIT', _} -> integer_to_list(?MAX_RADIUS);
         Int when Int > ?MAX_RADIUS -> integer_to_list(?MAX_RADIUS);
-        Int when Int < 0           -> "0";
-        Int                        -> integer_to_list(Int)
+        Int when Int < 0 -> "0";
+        Int -> integer_to_list(Int)
     end.
 
-fetch_aircraft_by_point(Lat, Lon, Radius) ->
-    make_request(fmt("~spoint/~s/~s/~s", [?BASE_URL, Lat, Lon, limit_radius(Radius)])).
-fetch_closest_aircraft(Lat, Lon, Radius) ->
-    make_request(fmt("~sclosest/~s/~s/~s", [?BASE_URL, Lat, Lon, limit_radius(Radius)])).
-fetch_aircraft_by_callsign(C)     -> make_request(fmt("~scallsign/~s",     [?BASE_URL, C])).
-fetch_aircraft_by_icao(I)         -> make_request(fmt("~sicao/~s",         [?BASE_URL, I])).
-fetch_aircraft_by_registration(R) -> make_request(fmt("~sregistration/~s", [?BASE_URL, R])).
-fetch_aircraft_by_type(T)         -> make_request(fmt("~stype/~s",         [?BASE_URL, T])).
-fetch_aircraft_by_squawk(S)       -> make_request(fmt("~ssquawk/~s",       [?BASE_URL, S])).
-fetch_military_aircraft()         -> make_request(?BASE_URL ++ "mil").
-fetch_pia_aircraft()              -> make_request(?BASE_URL ++ "pia").
-fetch_ladd_aircraft()             -> make_request(?BASE_URL ++ "ladd").
+%%====================================================================
+%% HTTP Request to ADS-B API
+%%====================================================================
 
-make_request(Url) ->
+fetch_aircraft(Path) ->
+    Url = ?BASE_URL ++ Path,
     case httpc:request(get, {Url, []}, [], [{body_format, binary}]) of
-        {ok, {{_, 200, _}, _, Body}} -> parse_aircraft_data(Body);
-        _                            -> []
+        {ok, {{_, 200, _}, _, Body}} ->
+            parse_aircraft_data(Body);
+        _ ->
+            []
     end.
 
-fmt(Fmt, Args) -> lists:flatten(io_lib:format(Fmt, Args)).
+%%====================================================================
+%% Parse aircraft JSON into embryos
+%%====================================================================
 
 parse_aircraft_data(JsonBinary) ->
-    try json:decode(JsonBinary) of
+    case catch json:decode(JsonBinary) of
         #{<<"ac">> := AircraftList} when is_list(AircraftList) ->
-            Filtered = filter_valid_aircraft(AircraftList),
-            build_embryos(Filtered, 1, []);
+            case AircraftList of
+                [] -> [];
+                _  ->
+                    Valid = [A || A <- AircraftList, is_valid_aircraft(A)],
+                    build_embryos(Valid, 1, [])
+            end;
         _ -> []
-    catch
-        _:_ -> []
-    end.
-
-filter_valid_aircraft(List) ->
-    Valid = [A || A <- List, is_valid_aircraft(A)],
-    case length(Valid) > ?MAX_RESULTS of
-        true  -> lists:sublist(Valid, ?MAX_RESULTS);
-        false -> Valid
     end.
 
 is_valid_aircraft(A) when is_map(A) ->
-    HasHex  = maps:is_key(<<"hex">>, A)
-              andalso maps:get(<<"hex">>, A) =/= null
-              andalso maps:get(<<"hex">>, A) =/= <<>>,
-    HasPos  = maps:is_key(<<"lat">>, A)
-              andalso maps:is_key(<<"lon">>, A)
-              andalso maps:get(<<"lat">>, A) =/= null
-              andalso maps:get(<<"lon">>, A) =/= null,
-    AltOk   = case maps:get(<<"alt_baro">>, A, null) of
-        null                    -> true;
-        Alt when is_number(Alt) -> Alt >= ?MIN_ALTITUDE andalso Alt =< ?MAX_ALTITUDE;
-        _                       -> false
-    end,
-    SpeedOk = case maps:get(<<"gs">>, A, null) of
-        null                      -> true;
-        Speed when is_number(Speed) -> Speed >= ?MIN_SPEED andalso Speed =< ?MAX_SPEED;
-        _                           -> false
-    end,
-    HasHex andalso HasPos andalso AltOk andalso SpeedOk;
+    has_data(A, <<"hex">>) andalso
+    has_data(A, <<"lat">>) andalso
+    has_data(A, <<"lon">>);
 is_valid_aircraft(_) -> false.
 
-build_embryos([], _Idx, Acc) ->
-    lists:reverse(Acc);
-build_embryos([H | T], Idx, Acc) ->
-    build_embryos(T, Idx + 1, [build_single_embryo(H, Idx) | Acc]).
+has_data(Map, Key) ->
+    maps:is_key(Key, Map) andalso maps:get(Key, Map) =/= null.
 
-build_single_embryo(A, Idx) ->
-    Hex          = maps:get(<<"hex">>,       A, <<"Unknown">>),
-    Flight       = maps:get(<<"flight">>,    A, <<"Unknown">>),
-    Registration = maps:get(<<"r">>,         A, <<"Unknown">>),
-    AltBaro      = maps:get(<<"alt_baro">>,  A, null),
-    GroundSpeed  = maps:get(<<"gs">>,        A, null),
-    Track        = maps:get(<<"track">>,     A, null),
-    Emergency    = maps:get(<<"emergency">>, A, <<"none">>),
-    Alert        = maps:get(<<"alert">>,     A, 0),
-    Description  = build_description(Flight, Hex, Registration,
-                                     AltBaro, GroundSpeed, Track,
-                                     Emergency, Alert),
-    TrackingUrl  = list_to_binary(fmt("https://adsb.lol/?icao=~s",
-                                      [binary_to_list(Hex)])),
+build_embryos([], _I, Acc) -> lists:reverse(Acc);
+build_embryos([H|T], I, Acc) ->
+    Embryo = make_embryo(H, I),
+    build_embryos(T, I+1, [Embryo|Acc]).
+
+make_embryo(A, I) ->
+    Hex = maps:get(<<"hex">>, A),
+    Call = maps:get(<<"flight">>, A, <<"">>),
+    Reg  = maps:get(<<"r">>, A, <<"">>),
+    Alt  = maps:get(<<"alt_baro">>, A, null),
+    GS   = maps:get(<<"gs">>, A, null),
+    Track= maps:get(<<"track">>, A, null),
+
+    TrackingUrl = list_to_binary(fmt("https://adsb.lol/?icao=~s", [binary_to_list(Hex)])),
+
     #{
         <<"properties">> => #{
             <<"url">>           => TrackingUrl,
-            <<"resume">>        => list_to_binary(Description),
             <<"hex">>           => Hex,
-            <<"flight">>        => Flight,
-            <<"registration">>  => Registration,
-            <<"altitude_baro">> => format_altitude(AltBaro),
-            <<"ground_speed">>  => format_speed(GroundSpeed),
+            <<"flight">>        => Call,
+            <<"registration">>  => Reg,
+            <<"altitude_baro">> => format_alt(Alt),
+            <<"ground_speed">>  => format_speed(GS),
             <<"track">>         => format_heading(Track),
-            <<"emergency">>     => Emergency,
-            <<"alert">>         => format_boolean(Alert),
-            <<"index">>         => Idx
+            <<"index">>         => I
         }
     }.
 
-build_description(Flight, Hex, Registration, AltBaro, GroundSpeed,
-                  Track, Emergency, Alert) ->
-    FlightId = determine_flight_id(Flight, Hex, Registration),
-    RegStr   = build_reg_str(Registration, FlightId),
-    AltStr   = case AltBaro of
-        N when is_number(N) -> fmt(" at ~p ft", [N]);
-        _                   -> ""
-    end,
-    SpeedStr = case GroundSpeed of
-        GS when is_number(GS), GS > 0 -> fmt(", ~.1f kts", [GS]);
-        _                              -> ""
-    end,
-    TrackStr = case Track of
-        T when is_number(T) -> fmt(", heading ~.1f deg", [T]);
-        _                   -> ""
-    end,
-    AlertStr = case Alert of
-        1 -> " [ALERT]";
-        _ -> ""
-    end,
-    EmergencyStr = case Emergency of
-        <<"none">>    -> "";
-        <<"general">> -> " [EMERGENCY]";
-        E when is_binary(E) -> fmt(" [EMERGENCY: ~s]", [binary_to_list(E)]);
-        _             -> ""
-    end,
-    lists:flatten(fmt("Aircraft ~s~s~s~s~s~s~s.",
-        [FlightId, RegStr, AltStr, SpeedStr, TrackStr, AlertStr, EmergencyStr])).
+format_alt(null) -> <<"N/A">>;
+format_alt(X) -> list_to_binary(fmt("~p ft", [X])).
 
-determine_flight_id(Flight, Hex, Registration) ->
-    FlightStr = trim_bin(Flight),
-    HexStr    = trim_bin(Hex),
-    RegStr    = trim_bin(Registration),
-    case FlightStr of
-        ""        -> use_fallback(RegStr, HexStr);
-        "Unknown" -> use_fallback(RegStr, HexStr);
-        F         -> F
-    end.
+format_speed(null) -> <<"N/A">>;
+format_speed(X) -> list_to_binary(fmt("~p kts", [X])).
 
-use_fallback("",        HexStr) -> HexStr;
-use_fallback("Unknown", HexStr) -> HexStr;
-use_fallback(RegStr,    _)      -> RegStr.
+format_heading(null) -> <<"N/A">>;
+format_heading(X) -> list_to_binary(fmt("~p deg", [X])).
 
-build_reg_str(Registration, FlightId) ->
-    RegStr = trim_bin(Registration),
-    case RegStr =:= "" orelse RegStr =:= FlightId of
-        true  -> "";
-        false -> fmt(" [~s]", [RegStr])
-    end.
-
-trim_bin(B) when is_binary(B) -> string:trim(binary_to_list(B));
-trim_bin(_)                   -> "".
-
-format_altitude(null)                 -> <<"N/A">>;
-format_altitude(A) when is_number(A) -> list_to_binary(fmt("~p ft",  [A]));
-format_altitude(_)                    -> <<"N/A">>.
-
-format_speed(null)                    -> <<"N/A">>;
-format_speed(S) when is_number(S)    -> list_to_binary(fmt("~p kts", [S]));
-format_speed(_)                       -> <<"N/A">>.
-
-format_heading(null)                  -> <<"N/A">>;
-format_heading(H) when is_number(H)  -> list_to_binary(fmt("~p deg", [H]));
-format_heading(_)                     -> <<"N/A">>.
-
-format_boolean(0)     -> <<"false">>;
-format_boolean(1)     -> <<"true">>;
-format_boolean(true)  -> <<"true">>;
-format_boolean(false) -> <<"false">>;
-format_boolean(_)     -> <<"unknown">>.
+fmt(Fmt, Args) -> lists:flatten(io_lib:format(Fmt, Args)).
 
 %%====================================================================
-%% Internal helpers
+%% Utility
 %%====================================================================
-
--spec url_of(map()) -> binary().
-url_of(#{<<"properties">> := #{<<"url">> := Url}}) -> Url;
-url_of(_) -> <<>>.
+url_of(#{<<"properties">> := #{<<"url">> := U}}) -> U.
