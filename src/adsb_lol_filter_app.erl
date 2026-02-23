@@ -1,19 +1,21 @@
 %%%-------------------------------------------------------------------
-%%% @doc ADS-B aircraft data filter using the adsb.lol API.
+%%% @doc ADS-B aircraft data agent using the adsb.lol API.
 %%%
-%%% Queries the adsb.lol v2 API based on the incoming search value
-%%% and returns a list of embryo maps — one per valid aircraft.
+%%% As an agent this module:
+%%%   - Announces capabilities to em_disco on startup via `agent_hello'.
+%%%   - Maintains a memory of tracking URLs already returned, so
+%%%     duplicate aircraft across successive queries are filtered out.
 %%%
-%%% Supported query types (auto-detected or explicit via "query_type"):
-%%%   icao, registration, callsign, type, squawk,
-%%%   military, pia, ladd, point, closest.
+%%% Handler contract: `handle/2' (Body, Memory) -> {RawList, NewMemory}.
+%%% Returns a raw Erlang list — em_filter_server encodes it.
+%%% Memory schema: `#{seen => #{binary_url => true}}'.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(adsb_lol_filter_app).
 -behaviour(application).
 
 -export([start/2, stop/1]).
--export([handle/1]).
+-export([handle/1, handle/2]).
 
 -define(BASE_URL,    "https://api.adsb.lol/v2/").
 -define(MIN_ALTITUDE, 0).
@@ -23,29 +25,54 @@
 -define(MAX_RESULTS,  100).
 -define(MAX_RADIUS,   250).
 
+-define(CAPABILITIES, [
+    <<"adsb">>,
+    <<"aircraft">>,
+    <<"realtime">>,
+    <<"aviation">>,
+    <<"tracking">>
+]).
+
 %%====================================================================
 %% Application behaviour
 %%====================================================================
 
 start(_Type, _Args) ->
-    em_filter:start_filter(adsb_lol_filter, ?MODULE).
+    em_filter:start_agent(adsb_lol_filter, ?MODULE, #{
+        capabilities => ?CAPABILITIES,
+        memory       => ets
+    }).
 
 stop(_State) ->
     em_filter:stop_filter(adsb_lol_filter).
 
 %%====================================================================
-%% Filter handler — returns a list of embryo maps
+%% Agent handler — with memory (primary path)
 %%====================================================================
 
-%% @doc Called by em_filter_server for every incoming query.
-%% Returns a list of embryo maps (not pre-encoded JSON).
+handle(Body, Memory) when is_binary(Body) ->
+    Seen    = maps:get(seen, Memory, #{}),
+    Embryos = generate_embryo_list(Body),
+    Fresh   = [E || E <- Embryos, not maps:is_key(url_of(E), Seen)],
+    NewSeen = lists:foldl(fun(E, Acc) ->
+        Acc#{url_of(E) => true}
+    end, Seen, Fresh),
+    {Fresh, Memory#{seen => NewSeen}};
+
+handle(_Body, Memory) ->
+    {[], Memory}.
+
+%%====================================================================
+%% Plain filter handler — backward compatibility
+%%====================================================================
+
 handle(Body) when is_binary(Body) ->
     generate_embryo_list(Body);
 handle(_) ->
     [].
 
 %%====================================================================
-%% Query dispatch
+%% Query dispatch (unchanged)
 %%====================================================================
 
 generate_embryo_list(JsonBinary) ->
@@ -62,10 +89,6 @@ generate_embryo_list(JsonBinary) ->
     catch
         _:_ -> []
     end.
-
-%%--------------------------------------------------------------------
-%% Query type auto-detection
-%%--------------------------------------------------------------------
 
 detect_query_type(Value) ->
     case length(Value) of
@@ -104,10 +127,6 @@ aircraft_types() ->
      "B737","B738","B739","B747","B757","B767","B777","B787",
      "E190","E195","CRJ2","CRJ7","CRJ9","DHC8","AT72"].
 
-%%--------------------------------------------------------------------
-%% Fetch dispatch
-%%--------------------------------------------------------------------
-
 fetch_by_type("point", _, #{<<"lat">> := Lat, <<"lon">> := Lon, <<"radius">> := R}) ->
     fetch_aircraft_by_point(binary_to_list(Lat), binary_to_list(Lon), binary_to_list(R));
 fetch_by_type("closest", _, #{<<"lat">> := Lat, <<"lon">> := Lon, <<"radius">> := R}) ->
@@ -122,32 +141,26 @@ fetch_by_type("pia",          _, _) -> fetch_pia_aircraft();
 fetch_by_type("ladd",         _, _) -> fetch_ladd_aircraft();
 fetch_by_type(_Unknown,       _, _) -> [].
 
-%%--------------------------------------------------------------------
-%% HTTP helpers
-%%--------------------------------------------------------------------
-
 limit_radius(R) ->
     case catch list_to_integer(R) of
-        {'EXIT', _}                  -> integer_to_list(?MAX_RADIUS);
-        Int when Int > ?MAX_RADIUS   -> integer_to_list(?MAX_RADIUS);
-        Int when Int < 0             -> "0";
-        Int                          -> integer_to_list(Int)
+        {'EXIT', _}                -> integer_to_list(?MAX_RADIUS);
+        Int when Int > ?MAX_RADIUS -> integer_to_list(?MAX_RADIUS);
+        Int when Int < 0           -> "0";
+        Int                        -> integer_to_list(Int)
     end.
 
 fetch_aircraft_by_point(Lat, Lon, Radius) ->
     make_request(fmt("~spoint/~s/~s/~s", [?BASE_URL, Lat, Lon, limit_radius(Radius)])).
-
 fetch_closest_aircraft(Lat, Lon, Radius) ->
     make_request(fmt("~sclosest/~s/~s/~s", [?BASE_URL, Lat, Lon, limit_radius(Radius)])).
-
-fetch_aircraft_by_callsign(C)    -> make_request(fmt("~scallsign/~s",    [?BASE_URL, C])).
-fetch_aircraft_by_icao(I)        -> make_request(fmt("~sicao/~s",        [?BASE_URL, I])).
-fetch_aircraft_by_registration(R)-> make_request(fmt("~sregistration/~s",[?BASE_URL, R])).
-fetch_aircraft_by_type(T)        -> make_request(fmt("~stype/~s",        [?BASE_URL, T])).
-fetch_aircraft_by_squawk(S)      -> make_request(fmt("~ssquawk/~s",      [?BASE_URL, S])).
-fetch_military_aircraft()        -> make_request(?BASE_URL ++ "mil").
-fetch_pia_aircraft()             -> make_request(?BASE_URL ++ "pia").
-fetch_ladd_aircraft()            -> make_request(?BASE_URL ++ "ladd").
+fetch_aircraft_by_callsign(C)     -> make_request(fmt("~scallsign/~s",     [?BASE_URL, C])).
+fetch_aircraft_by_icao(I)         -> make_request(fmt("~sicao/~s",         [?BASE_URL, I])).
+fetch_aircraft_by_registration(R) -> make_request(fmt("~sregistration/~s", [?BASE_URL, R])).
+fetch_aircraft_by_type(T)         -> make_request(fmt("~stype/~s",         [?BASE_URL, T])).
+fetch_aircraft_by_squawk(S)       -> make_request(fmt("~ssquawk/~s",       [?BASE_URL, S])).
+fetch_military_aircraft()         -> make_request(?BASE_URL ++ "mil").
+fetch_pia_aircraft()              -> make_request(?BASE_URL ++ "pia").
+fetch_ladd_aircraft()             -> make_request(?BASE_URL ++ "ladd").
 
 make_request(Url) ->
     case httpc:request(get, {Url, []}, [], [{body_format, binary}]) of
@@ -155,12 +168,7 @@ make_request(Url) ->
         _                            -> []
     end.
 
-%% Shorthand for lists:flatten(io_lib:format(...))
 fmt(Fmt, Args) -> lists:flatten(io_lib:format(Fmt, Args)).
-
-%%--------------------------------------------------------------------
-%% JSON parsing and embryo building
-%%--------------------------------------------------------------------
 
 parse_aircraft_data(JsonBinary) ->
     try json:decode(JsonBinary) of
@@ -180,23 +188,22 @@ filter_valid_aircraft(List) ->
     end.
 
 is_valid_aircraft(A) when is_map(A) ->
-    HasHex = maps:is_key(<<"hex">>, A)
-             andalso maps:get(<<"hex">>, A) =/= null
-             andalso maps:get(<<"hex">>, A) =/= <<>>,
-    HasPos = maps:is_key(<<"lat">>, A)
-             andalso maps:is_key(<<"lon">>, A)
-             andalso maps:get(<<"lat">>, A) =/= null
-             andalso maps:get(<<"lon">>, A) =/= null,
-    AltOk  = case maps:get(<<"alt_baro">>, A, null) of
-        null                      -> true;
-        Alt when is_number(Alt)   -> Alt >= ?MIN_ALTITUDE andalso Alt =< ?MAX_ALTITUDE;
-        _                         -> false
+    HasHex  = maps:is_key(<<"hex">>, A)
+              andalso maps:get(<<"hex">>, A) =/= null
+              andalso maps:get(<<"hex">>, A) =/= <<>>,
+    HasPos  = maps:is_key(<<"lat">>, A)
+              andalso maps:is_key(<<"lon">>, A)
+              andalso maps:get(<<"lat">>, A) =/= null
+              andalso maps:get(<<"lon">>, A) =/= null,
+    AltOk   = case maps:get(<<"alt_baro">>, A, null) of
+        null                    -> true;
+        Alt when is_number(Alt) -> Alt >= ?MIN_ALTITUDE andalso Alt =< ?MAX_ALTITUDE;
+        _                       -> false
     end,
     SpeedOk = case maps:get(<<"gs">>, A, null) of
         null                      -> true;
         Speed when is_number(Speed) -> Speed >= ?MIN_SPEED andalso Speed =< ?MAX_SPEED;
-
-        _                         -> false
+        _                           -> false
     end,
     HasHex andalso HasPos andalso AltOk andalso SpeedOk;
 is_valid_aircraft(_) -> false.
@@ -215,7 +222,6 @@ build_single_embryo(A, Idx) ->
     Track        = maps:get(<<"track">>,     A, null),
     Emergency    = maps:get(<<"emergency">>, A, <<"none">>),
     Alert        = maps:get(<<"alert">>,     A, 0),
-
     Description  = build_description(Flight, Hex, Registration,
                                      AltBaro, GroundSpeed, Track,
                                      Emergency, Alert),
@@ -223,23 +229,19 @@ build_single_embryo(A, Idx) ->
                                       [binary_to_list(Hex)])),
     #{
         <<"properties">> => #{
-            <<"url">>              => TrackingUrl,
-            <<"resume">>           => list_to_binary(Description),
-            <<"hex">>              => Hex,
-            <<"flight">>           => Flight,
-            <<"registration">>     => Registration,
-            <<"altitude_baro">>    => format_altitude(AltBaro),
-            <<"ground_speed">>     => format_speed(GroundSpeed),
-            <<"track">>            => format_heading(Track),
-            <<"emergency">>        => Emergency,
-            <<"alert">>            => format_boolean(Alert),
-            <<"index">>            => Idx
+            <<"url">>           => TrackingUrl,
+            <<"resume">>        => list_to_binary(Description),
+            <<"hex">>           => Hex,
+            <<"flight">>        => Flight,
+            <<"registration">>  => Registration,
+            <<"altitude_baro">> => format_altitude(AltBaro),
+            <<"ground_speed">>  => format_speed(GroundSpeed),
+            <<"track">>         => format_heading(Track),
+            <<"emergency">>     => Emergency,
+            <<"alert">>         => format_boolean(Alert),
+            <<"index">>         => Idx
         }
     }.
-
-%%--------------------------------------------------------------------
-%% Description builder
-%%--------------------------------------------------------------------
 
 build_description(Flight, Hex, Registration, AltBaro, GroundSpeed,
                   Track, Emergency, Alert) ->
@@ -264,9 +266,8 @@ build_description(Flight, Hex, Registration, AltBaro, GroundSpeed,
     EmergencyStr = case Emergency of
         <<"none">>    -> "";
         <<"general">> -> " [EMERGENCY]";
-        E when is_binary(E) ->
-            fmt(" [EMERGENCY: ~s]", [binary_to_list(E)]);
-        _ -> ""
+        E when is_binary(E) -> fmt(" [EMERGENCY: ~s]", [binary_to_list(E)]);
+        _             -> ""
     end,
     lists:flatten(fmt("Aircraft ~s~s~s~s~s~s~s.",
         [FlightId, RegStr, AltStr, SpeedStr, TrackStr, AlertStr, EmergencyStr])).
@@ -292,28 +293,31 @@ build_reg_str(Registration, FlightId) ->
         false -> fmt(" [~s]", [RegStr])
     end.
 
-%% Converts a binary to a trimmed string; returns "" for non-binaries.
 trim_bin(B) when is_binary(B) -> string:trim(binary_to_list(B));
 trim_bin(_)                   -> "".
 
-%%--------------------------------------------------------------------
-%% Format helpers
-%%--------------------------------------------------------------------
+format_altitude(null)                 -> <<"N/A">>;
+format_altitude(A) when is_number(A) -> list_to_binary(fmt("~p ft",  [A]));
+format_altitude(_)                    -> <<"N/A">>.
 
-format_altitude(null)                    -> <<"N/A">>;
-format_altitude(A) when is_number(A)    -> list_to_binary(fmt("~p ft",  [A]));
-format_altitude(_)                       -> <<"N/A">>.
+format_speed(null)                    -> <<"N/A">>;
+format_speed(S) when is_number(S)    -> list_to_binary(fmt("~p kts", [S]));
+format_speed(_)                       -> <<"N/A">>.
 
-format_speed(null)                       -> <<"N/A">>;
-format_speed(S) when is_number(S)       -> list_to_binary(fmt("~p kts", [S]));
-format_speed(_)                          -> <<"N/A">>.
-
-format_heading(null)                     -> <<"N/A">>;
-format_heading(H) when is_number(H)     -> list_to_binary(fmt("~p deg", [H]));
-format_heading(_)                        -> <<"N/A">>.
+format_heading(null)                  -> <<"N/A">>;
+format_heading(H) when is_number(H)  -> list_to_binary(fmt("~p deg", [H]));
+format_heading(_)                     -> <<"N/A">>.
 
 format_boolean(0)     -> <<"false">>;
 format_boolean(1)     -> <<"true">>;
 format_boolean(true)  -> <<"true">>;
 format_boolean(false) -> <<"false">>;
 format_boolean(_)     -> <<"unknown">>.
+
+%%====================================================================
+%% Internal helpers
+%%====================================================================
+
+-spec url_of(map()) -> binary().
+url_of(#{<<"properties">> := #{<<"url">> := Url}}) -> Url;
+url_of(_) -> <<>>.
