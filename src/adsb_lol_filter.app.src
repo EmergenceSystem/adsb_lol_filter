@@ -1,16 +1,24 @@
 {application, adsb_lol_filter, [
     {description, "em_filter example for ADSB.lol"},
-    {vsn, "0.1.0"},
-    {registered, []},
+    {vsn, "0.2.0"},
+    {registered, [adsb_lol_filter_sup, adsb_lol_filter_server]},
     {mod, {adsb_lol_filter_app, []}},
     {applications, [
         kernel,
         stdlib,
 	    ssl,
+        cowboy,
         em_filter
     ]},
-    {env, []},
-    {modules, []},
+    {env, [
+        {pop_port,   0},
+        {query_port, 0},
+        {pop_seeds,  []}
+    ]},
+    {modules, [
+        adsb_lol_filter_sup,
+        adsb_lol_filter_server
+    ]},
     {licenses, ["Apache-2.0"]},
     {links, [{"GitHub", "https://github.com/EmergenceSystem/adsb_lol_filter"}]}
 ]}.
